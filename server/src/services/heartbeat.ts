@@ -49,6 +49,10 @@ import {
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
+  SIGTERM_EXIT_CODE,
+  shouldRetryServerShutdownRace,
+} from "./server-shutdown-race.js";
+import {
   adapterExecutionControls,
   captureAdapterStopOwnership,
   createAdapterExecutionControl,
@@ -9555,6 +9559,14 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  // Set as early as the SIGTERM handler can call noteGracefulShutdownStarted so
+  // children that lose the drain race (exit 143, no signal) still match the
+  // same-minute window even before prepareHotRestartShutdown runs.
+  let lastGracefulShutdownAt: Date | null = null;
+  function noteGracefulShutdownStarted(now = new Date()) {
+    shutdownInProgress = true;
+    lastGracefulShutdownAt = now;
+  }
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -14600,7 +14612,7 @@ export function heartbeatService(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
   ) {
-    shutdownInProgress = true;
+    noteGracefulShutdownStarted(now);
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -15198,6 +15210,7 @@ export function heartbeatService(
     now = new Date(),
     runIds: readonly string[] | null = null,
   ) {
+    noteGracefulShutdownStarted(now);
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
       return {
@@ -25382,6 +25395,21 @@ export function heartbeatService(
           outcome = "failed";
         }
 
+        // Children that die with exit 143 / no signal during a server SIGTERM
+        // lose the drain race and would otherwise land as adapter_failed with
+        // no retry. Reclassify onto the same path as server_shutdown_interrupted.
+        const finishedAtForShutdownRace = new Date();
+        const serverShutdownRace = shouldRetryServerShutdownRace({
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          shutdownInProgress,
+          finishedAt: finishedAtForShutdownRace,
+          shutdownStartedAt: lastGracefulShutdownAt,
+        });
+        if (outcome === "failed" && serverShutdownRace) {
+          outcome = "interrupted";
+        }
+
         const nextSessionState = resolveNextSessionState({
           adapterType: agent.adapterType,
           codec: sessionCodec,
@@ -25406,11 +25434,13 @@ export function heartbeatService(
             ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
             : outcome === "succeeded"
               ? null
-              : redactCurrentUserText(
-                  adapterResult.errorMessage ??
-                    (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
-                );
+              : outcome === "interrupted"
+                ? `Interrupted by graceful server shutdown (exit ${adapterResult.exitCode ?? SIGTERM_EXIT_CODE})`
+                : redactCurrentUserText(
+                    adapterResult.errorMessage ??
+                      (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+                    currentUserRedactionOptions,
+                  );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -25418,11 +25448,13 @@ export function heartbeatService(
             ? "timeout"
             : outcome === "cancelled"
               ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
+              : outcome === "interrupted"
+                ? "server_shutdown_interrupted"
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ??
+                    recordedResponsibleUserDenialCode ??
+                    "adapter_failed")
+                  : null;
 
         let logSummary: {
           bytes: number | null;
@@ -25457,7 +25489,9 @@ export function heartbeatService(
               ? "cancelled"
               : outcome === "timed_out"
                 ? "timed_out"
-                : "failed";
+                : outcome === "interrupted"
+                  ? "interrupted"
+                  : "failed";
 
         const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
         const usageJson =
@@ -25619,10 +25653,14 @@ export function heartbeatService(
 
         await setWakeupStatus(
           run.wakeupRequestId,
-          outcome === "succeeded" ? "completed" : status,
+          outcome === "succeeded"
+            ? "completed"
+            : outcome === "interrupted"
+              ? "cancelled"
+              : status,
           {
             finishedAt: new Date(),
-            error: runErrorMessage,
+            error: outcome === "interrupted" ? null : runErrorMessage,
           },
         );
 
@@ -25803,7 +25841,34 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          let shutdownRaceRetryQueued = false;
+          if (
+            outcome === "interrupted" &&
+            runErrorCode === "server_shutdown_interrupted"
+          ) {
+            // Same path as drainRunningRunsForShutdown: process-loss retry, and
+            // only release the issue lock when no retry was scheduled.
+            const retry = await enqueueProcessLossRetry(
+              livenessRun,
+              agent,
+              finishedAtForShutdownRace,
+            );
+            shutdownRaceRetryQueued = Boolean(retry);
+            if (retry) {
+              await appendRunEvent(livenessRun, {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message:
+                  "Adapter exit 143 during server shutdown reclassified as server_shutdown_interrupted; queued retry",
+                payload: {
+                  exitCode: adapterResult.exitCode ?? null,
+                  signal: adapterResult.signal ?? null,
+                  retryRunId: retry.id,
+                },
+              });
+            }
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25845,14 +25910,16 @@ export function heartbeatService(
             resolvedPresentationDecision,
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
-          await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
-              readNonEmptyString(
-                parseObject(livenessRun.contextSnapshot).goalControlRequestId,
-              ) !== null ||
-              parseObject(livenessRun.contextSnapshot)
-                .resumeSessionGoalHeartbeat === true,
-          });
+          if (!shutdownRaceRetryQueued) {
+            await releaseIssueExecutionAndPromote(livenessRun, {
+              suppressImmediateRecovery: conversationSettled ||
+                readNonEmptyString(
+                  parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+                ) !== null ||
+                parseObject(livenessRun.contextSnapshot)
+                  .resumeSessionGoalHeartbeat === true,
+            });
+          }
           if (!conversationSettled) {
             await handleIssueReviewPathDisposition(livenessRun);
             if (livenessRun.runtimeMode !== "native") {
@@ -30253,6 +30320,7 @@ export function heartbeatService(
 
     reportRunActivity: clearDetachedRunWarning,
 
+    noteGracefulShutdownStarted,
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,

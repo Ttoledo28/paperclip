@@ -1138,6 +1138,7 @@ async function startServerWithDatabaseTeardown(
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
+  let noteGracefulShutdownStarted: ((now?: Date) => void) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
@@ -1317,6 +1318,7 @@ async function startServerWithDatabaseTeardown(
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+    noteGracefulShutdownStarted = heartbeat.noteGracefulShutdownStarted;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
@@ -1932,6 +1934,9 @@ async function startServerWithDatabaseTeardown(
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Mark before any await so adapter finalizers that lose the drain race
+    // (exit 143, no signal) still see the same-minute shutdown window.
+    noteGracefulShutdownStarted?.(new Date());
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();

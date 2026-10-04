@@ -231,8 +231,9 @@ Managed updates create a database backup before switching payloads, verify the
 new CLI, atomically flip `current`, and restart an installed service. That
 restart drains active agent runs (same as `paperclipai service restart --wait`)
 instead of adopting them across the binary change, so the restart can take
-longer while in-flight work finishes. Rollback uses the same drain restart.
-A failed install or verification leaves the previous payload active.
+longer while active runs are interrupted and eligible retries are scheduled.
+Rollback uses the same drain restart. A failed install or verification leaves
+the previous payload active.
 
 If the service is stopped, start it with `paperclipai service start` before
 updating so Paperclip can take the safety backup. Use

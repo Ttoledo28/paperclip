@@ -292,7 +292,8 @@ environments receive foreground `paperclipai run` guidance.
 `service restart` hot-restarts while preserving (adopting) eligible active agent
 runs by default. Pass `--wait` to drain those runs instead of adopting them —
 the same drain path managed `update` / `--rollback` use after flipping
-`current`. Drain can delay the restart until in-flight work finishes.
+`current`. Drain can delay the restart while active runs are interrupted and
+eligible retries are scheduled.
 
 `paperclipai doctor` includes managed-install and service-health diagnostics in
 addition to configuration, storage, database, logging, and port checks.

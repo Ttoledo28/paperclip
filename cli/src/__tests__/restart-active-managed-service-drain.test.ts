@@ -6,7 +6,8 @@ const restartManagedService = vi.fn(async () => ({
   report: null,
 }));
 
-const status = vi.fn(async () => ({ active: true, pid: 1, serviceName: "paperclip" }));
+type StatusStub = { active: boolean; pid: number | null; serviceName: string };
+const status = vi.fn(async (): Promise<StatusStub> => ({ active: true, pid: 1, serviceName: "paperclip" }));
 const detectServiceManager = vi.fn(async () => ({
   supported: true as const,
   manager: { status, restart: vi.fn() },

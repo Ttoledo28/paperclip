@@ -89,8 +89,11 @@ source checkout services must configure their own executable and child-process `
 For custom service wrappers, use an absolute, supported Node executable and put
 that executable's directory first on `PATH`. Keep required existing PATH entries.
 On Linux, verify the running executable with `/proc/<server-pid>/exe`; an
-interactive shell version check alone is insufficient. Use the guarded restart
-procedure in [DEVELOPING.md](DEVELOPING.md#hot-restart-deploys) when jobs are active.
+interactive shell version check alone is insufficient. For operator/source
+restarts with active jobs, use the guarded restart procedure in
+[DEVELOPING.md](DEVELOPING.md#hot-restart-deploys) (default adopts eligible
+runs; pass `--drain-required` only when you need terminate-and-retry). Managed
+`paperclipai update` / `--rollback` already drain, like `service restart --wait`.
 
 Legacy local adapters default to ACP, including configurations with no `engine`
 field or the old `auto` value. An unavailable ACP runtime fails the run and the
@@ -225,8 +228,11 @@ paperclipai update --version 2026.720.0
 ```
 
 Managed updates create a database backup before switching payloads, verify the
-new CLI, atomically flip `current`, and restart an installed service. A failed
-install or verification leaves the previous payload active.
+new CLI, atomically flip `current`, and restart an installed service. That
+restart drains active agent runs (same as `paperclipai service restart --wait`)
+instead of adopting them across the binary change, so the restart can take
+longer while in-flight work finishes. Rollback uses the same drain restart.
+A failed install or verification leaves the previous payload active.
 
 If the service is stopped, start it with `paperclipai service start` before
 updating so Paperclip can take the safety backup. Use

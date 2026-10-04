@@ -71,7 +71,7 @@ export async function restartActiveManagedService(expectedVersion: string): Prom
   const instanceId = resolvePaperclipInstanceId();
   const detection = await detectServiceManager({ instanceId });
   if (!detection.supported || !(await detection.manager.status()).active) return false;
-  // Auto-update is the hottest restart path; drain in-flight runs like `service restart --wait`.
+  // Payload switches cross binary versions; drain in-flight runs (like `service restart --wait`) instead of adopting them on the new payload.
   await restartManagedService({ instanceId, expectedVersion, waitForDrain: true });
   return true;
 }

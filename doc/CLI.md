@@ -289,6 +289,11 @@ Every service verb supports `--instance <id>` and `--json`. Linux and WSL2 use
 a systemd user unit when available; macOS uses a LaunchAgent. Unsupported
 environments receive foreground `paperclipai run` guidance.
 
+`service restart` hot-restarts while preserving (adopting) eligible active agent
+runs by default. Pass `--wait` to drain those runs instead of adopting them —
+the same drain path managed `update` / `--rollback` use after flipping
+`current`. Drain can delay the restart until in-flight work finishes.
+
 `paperclipai doctor` includes managed-install and service-health diagnostics in
 addition to configuration, storage, database, logging, and port checks.
 
